@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass, field
 
 from .clock import Clock
-from .errors import GatewayError
+from .errors import ErrorCode, GatewayError
 
 
 class RecordState(enum.Enum):
@@ -51,10 +51,65 @@ class IdempotencyStore:
         self._records: dict[str, IdempotencyRecord] = {}
 
     def begin(self, key: str, payload_fingerprint: str) -> BeginOutcome:
-        raise NotImplementedError
+        """Register intent to execute work for `key`.
+
+        Exactly one concurrent caller becomes LEADER; others either REPLAY a
+        completed result, WAIT for the in-flight leader, or get CONFLICT when
+        the same key carries a different payload fingerprint.
+        """
+        now = self._clock.now()
+        with self._lock:
+            record = self._records.get(key)
+            if record is not None and record.state is not RecordState.IN_FLIGHT and now >= record.expires_at:
+                # Expired terminal record: drop it so the key can be reused.
+                del self._records[key]
+                record = None
+
+            if record is None:
+                record = IdempotencyRecord(
+                    key=key,
+                    payload_fingerprint=payload_fingerprint,
+                    state=RecordState.IN_FLIGHT,
+                )
+                self._records[key] = record
+                return BeginOutcome(kind=BeginResult.LEADER, record=record)
+
+            if record.payload_fingerprint != payload_fingerprint:
+                return BeginOutcome(
+                    kind=BeginResult.CONFLICT,
+                    error=GatewayError(
+                        code=ErrorCode.IDEMPOTENCY_CONFLICT,
+                        message=(
+                            f"Idempotency key '{key}' was already used with a "
+                            "different payload; refusing to overwrite."
+                        ),
+                    ),
+                )
+
+            if record.state is RecordState.IN_FLIGHT:
+                return BeginOutcome(kind=BeginResult.WAIT, record=record)
+            if record.state is RecordState.COMPLETED:
+                return BeginOutcome(kind=BeginResult.REPLAY, record=record)
+            # FAILED: the previous attempt did not produce a result; allow this
+            # caller to take over as the new leader with a fresh record.
+            fresh = IdempotencyRecord(
+                key=key,
+                payload_fingerprint=payload_fingerprint,
+                state=RecordState.IN_FLIGHT,
+            )
+            self._records[key] = fresh
+            return BeginOutcome(kind=BeginResult.LEADER, record=fresh)
 
     def complete(self, record: IdempotencyRecord, result: object) -> None:
-        raise NotImplementedError
+        with self._lock:
+            record.state = RecordState.COMPLETED
+            record.result = result
+            record.expires_at = self._clock.now() + self._ttl
+            record.done.set()
 
     def fail(self, record: IdempotencyRecord, error: GatewayError) -> None:
-        raise NotImplementedError
+        with self._lock:
+            record.state = RecordState.FAILED
+            record.error = error
+            record.expires_at = self._clock.now() + self._ttl
+            record.done.set()
