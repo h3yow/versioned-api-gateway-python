@@ -9,6 +9,10 @@ dependencies = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# Bare `uv run pytest` prints every gateway decision (caller/version/key/verdict).
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(message)s"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"

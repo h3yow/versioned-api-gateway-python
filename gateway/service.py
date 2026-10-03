@@ -1,4 +1,15 @@
-"""Gateway orchestration: version negotiation -> quota -> idempotency -> downstream."""
+"""Gateway orchestration: version negotiation -> quota -> idempotency -> downstream.
+
+Cross-version idempotency model:
+    The idempotency record stores one *version-neutral business result*
+    (business key + canonical entity). Every client declaring the same key +
+    same payload converges on that single business result; when a result is
+    served back it is rendered through the **requesting** client's version, so
+    each caller sees its own declared shape while all views reference the same
+    write. A leader's failure converges the same way: the whole concurrent
+    batch observes the identical failure code and retry hint, and the
+    downstream is triggered at most once per batch.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +21,7 @@ from typing import Any, Callable
 
 from .clock import Clock
 from .errors import ErrorCode, GatewayError
-from .idempotency import BeginResult, IdempotencyStore
+from .idempotency import BeginResult, IdempotencyStore, RecordState, TerminalSnapshot
 from .quota import CallerTier, QuotaLimiter
 from .versioning import VersionRegistry
 
@@ -36,8 +47,31 @@ class GatewayResponse:
     replayed: bool = False
 
 
-# Downstream handler: (version, payload) -> response body dict.
-DownstreamHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
+@dataclass(frozen=True)
+class _DownstreamOutcome:
+    """Raw downstream verdict before version rendering / HTTP wrapping."""
+
+    ok: bool
+    error: GatewayError | None = None
+    result: Any = None  # canonical WriteResult | raw body dict, only when ok
+
+
+# Downstream handler: (version, payload) -> canonical WriteResult | raw body dict.
+DownstreamHandler = Callable[[str, dict[str, Any]], Any]
+# Version renderer: (target version, canonical entity) -> response body dict.
+VersionRenderer = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    """Version-neutral outcome of one downstream write.
+
+    `business_key` is the stable identity of the business record; `entity` is
+    the canonical content all version views are rendered from.
+    """
+
+    business_key: str
+    entity: dict[str, Any]
 
 
 class DownstreamTimeout(Exception):
@@ -50,6 +84,13 @@ def _fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _canonical(result: Any) -> tuple[dict[str, Any], str | None]:
+    """Split a handler result into (canonical entity, business key)."""
+    if isinstance(result, WriteResult):
+        return result.entity, result.business_key
+    return result, None
+
+
 class Gateway:
     def __init__(
         self,
@@ -59,6 +100,7 @@ class Gateway:
         handlers: dict[str, DownstreamHandler],
         clock: Clock,
         wait_timeout_seconds: float = 10.0,
+        renderers: dict[str, VersionRenderer] | None = None,
     ) -> None:
         self._versions = versions
         self._quota = quota
@@ -66,6 +108,7 @@ class Gateway:
         self._handlers = handlers
         self._clock = clock
         self._wait_timeout = wait_timeout_seconds
+        self._renderers = renderers or {}
 
     def handle(self, request: GatewayRequest) -> GatewayResponse:
         """Process one request through the gateway pipeline.
@@ -88,9 +131,7 @@ class Gateway:
             )
             return self._reject(request, err, http_status=404)
 
-        # 2. Quota (consumed once per logical request, before idempotency so
-        #    replays of the same submission are not double-counted here: each
-        #    HTTP call is a distinct request and pays its own quota unit).
+        # 2. Quota: each HTTP call pays one quota unit, including replays.
         decision = self._quota.check_and_consume(request.tier, request.caller_id)
         if not decision.allowed:
             err = GatewayError(
@@ -108,7 +149,18 @@ class Gateway:
             return self._handle_idempotent(request, version, handler, negotiated.deprecated)
 
         # 4. Plain read/no-key request: straight to downstream.
-        return self._invoke(request, version, handler, negotiated.deprecated)
+        outcome = self._invoke(request, version, handler, negotiated.deprecated)
+        if outcome.ok:
+            entity, _ = _canonical(outcome.result)
+            return GatewayResponse(
+                ok=True,
+                status=200,
+                body=self._render(version, entity),
+                deprecated=negotiated.deprecated,
+            )
+        return self._reject(
+            request, outcome.error, http_status=self._status_for(outcome.error)
+        )
 
     # -- internals ---------------------------------------------------------
 
@@ -120,34 +172,98 @@ class Gateway:
         deprecated: bool,
     ) -> GatewayResponse:
         fingerprint = _fingerprint(request.payload)
-        while True:
-            outcome = self._idempotency.begin(request.idempotency_key, fingerprint)
-            if outcome.kind is BeginResult.CONFLICT:
-                return self._reject(request, outcome.error, http_status=409)
-            if outcome.kind is BeginResult.REPLAY:
-                logger.info(
-                    "caller=%s version=%s idem=%s verdict=replay basis=completed-record",
-                    request.caller_id, version, request.idempotency_key,
+        outcome = self._idempotency.begin(request.idempotency_key, fingerprint)
+
+        if outcome.kind is BeginResult.CONFLICT:
+            return self._reject(request, outcome.error, http_status=409)
+
+        if outcome.kind is BeginResult.REPLAY:
+            return self._replay_completed(
+                request, version, deprecated, self._idempotency.snapshot(outcome.record)
+            )
+
+        if outcome.kind is BeginResult.WAIT:
+            record = outcome.record
+            settled = record.done.wait(timeout=self._wait_timeout)
+            if not settled:
+                # Leader still has not returned; do not trigger a second call.
+                err = GatewayError(
+                    code=ErrorCode.DOWNSTREAM_TIMEOUT,
+                    message="Downstream dependency timed out. Safe to retry with the same idempotency key.",
+                    retry_after_seconds=1.0,
                 )
-                return GatewayResponse(
-                    ok=True,
-                    status=200,
-                    body=dict(outcome.record.result),
-                    deprecated=deprecated,
-                    replayed=True,
-                )
-            if outcome.kind is BeginResult.WAIT:
-                # Another in-flight request with the same key+payload: wait for
-                # it to finish, then re-enter begin() to replay its result.
-                outcome.record.done.wait(timeout=self._wait_timeout)
-                continue
-            # LEADER: execute downstream exactly once for this key.
-            response = self._invoke(request, version, handler, deprecated)
-            if response.ok:
-                self._idempotency.complete(outcome.record, response.body)
-            else:
-                self._idempotency.fail(outcome.record, response.error)
-            return response
+                return self._reject(request, err, http_status=504)
+            snapshot = self._idempotency.snapshot(record)
+            if snapshot.state is RecordState.COMPLETED:
+                return self._replay_completed(request, version, deprecated, snapshot)
+            # The leader of THIS concurrent batch failed: converge on its exact
+            # failure instead of being let through to hit downstream again.
+            return self._replay_failure(request, version, snapshot)
+
+        # LEADER: the only caller in this batch that touches the downstream.
+        leader_record = outcome.record
+        outcome = self._invoke(request, version, handler, deprecated)
+        if outcome.ok:
+            entity, business_key = _canonical(outcome.result)
+            self._idempotency.complete(leader_record, entity, business_key)
+            logger.info(
+                "caller=%s version=%s idem=%s verdict=executed basis=downstream-ok business_key=%s",
+                request.caller_id, version, request.idempotency_key, business_key or "-",
+            )
+            return GatewayResponse(
+                ok=True,
+                status=200,
+                body=self._render(version, entity),
+                deprecated=deprecated,
+            )
+        self._idempotency.fail(leader_record, outcome.error)
+        return self._reject(request, outcome.error, http_status=self._status_for(outcome.error))
+
+    def _replay_completed(
+        self,
+        request: GatewayRequest,
+        version: str,
+        deprecated: bool,
+        snapshot: TerminalSnapshot,
+    ) -> GatewayResponse:
+        # Render the shared canonical result in THIS caller's declared version.
+        body = self._render(version, snapshot.result)
+        logger.info(
+            "caller=%s version=%s idem=%s verdict=replay basis=completed-record business_key=%s",
+            request.caller_id, version, request.idempotency_key, snapshot.business_key or "-",
+        )
+        return GatewayResponse(
+            ok=True,
+            status=200,
+            body=body,
+            deprecated=deprecated,
+            replayed=True,
+        )
+
+    def _replay_failure(
+        self,
+        request: GatewayRequest,
+        version: str,
+        snapshot: TerminalSnapshot,
+    ) -> GatewayResponse:
+        error = snapshot.error
+        logger.info(
+            "caller=%s version=%s idem=%s verdict=rejected basis=%s convergence=leader-failure",
+            request.caller_id, version, request.idempotency_key, error.code.value,
+        )
+        return GatewayResponse(
+            ok=False,
+            status=self._status_for(error),
+            body={"error": {"code": error.code.value, "message": error.message}},
+            error=error,
+        )
+
+    def _render(self, version: str, entity: object) -> dict[str, Any]:
+        renderer = self._renderers.get(version)
+        if renderer is None:
+            # Backward-compatible default: the canonical body is already shaped.
+            return dict(entity)  # type: ignore[arg-type]
+        return renderer(version, entity)  # type: ignore[arg-type]
 
     def _invoke(
         self,
@@ -155,29 +271,30 @@ class Gateway:
         version: str,
         handler: DownstreamHandler,
         deprecated: bool,
-    ) -> GatewayResponse:
+    ) -> _DownstreamOutcome:
+        """Call the downstream once; return a raw verdict (no rendering)."""
+        del deprecated  # presentation is applied by the caller
         try:
-            body = handler(version, request.payload)
+            return _DownstreamOutcome(ok=True, result=handler(version, request.payload))
         except DownstreamTimeout:
-            err = GatewayError(
-                code=ErrorCode.DOWNSTREAM_TIMEOUT,
-                message="Downstream dependency timed out. Safe to retry with the same idempotency key.",
-                retry_after_seconds=1.0,
+            return _DownstreamOutcome(
+                ok=False,
+                error=GatewayError(
+                    code=ErrorCode.DOWNSTREAM_TIMEOUT,
+                    message="Downstream dependency timed out. Safe to retry with the same idempotency key.",
+                    retry_after_seconds=1.0,
+                ),
             )
-            return self._reject(request, err, http_status=504)
         except Exception:
             # Deliberately no exception details leak to the caller.
             logger.exception("downstream failure caller=%s version=%s", request.caller_id, version)
-            err = GatewayError(
-                code=ErrorCode.DOWNSTREAM_ERROR,
-                message="Downstream dependency failed. Safe to retry with the same idempotency key.",
+            return _DownstreamOutcome(
+                ok=False,
+                error=GatewayError(
+                    code=ErrorCode.DOWNSTREAM_ERROR,
+                    message="Downstream dependency failed. Safe to retry with the same idempotency key.",
+                ),
             )
-            return self._reject(request, err, http_status=502)
-        logger.info(
-            "caller=%s version=%s idem=%s verdict=executed basis=downstream-ok",
-            request.caller_id, version, request.idempotency_key,
-        )
-        return GatewayResponse(ok=True, status=200, body=body, deprecated=deprecated)
 
     def _reject(self, request: GatewayRequest, error: GatewayError, http_status: int) -> GatewayResponse:
         logger.info(
@@ -197,4 +314,8 @@ class Gateway:
             ErrorCode.VERSION_MISSING: 400,
             ErrorCode.VERSION_UNKNOWN: 404,
             ErrorCode.VERSION_SUNSET: 410,
+            ErrorCode.QUOTA_EXCEEDED: 429,
+            ErrorCode.IDEMPOTENCY_CONFLICT: 409,
+            ErrorCode.DOWNSTREAM_ERROR: 502,
+            ErrorCode.DOWNSTREAM_TIMEOUT: 504,
         }[error.code]

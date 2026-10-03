@@ -9,6 +9,19 @@ from gateway.service import Gateway
 from gateway.versioning import VersionInfo, VersionRegistry, VersionStatus
 
 
+class _GatewayOnlyFilter(logging.Filter):
+    """Keep live test output limited to gateway decision lines."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name == "gateway" or record.name.startswith("gateway.")
+
+
+def pytest_configure(config):
+    """Restrict the bare `pytest` live log output to gateway decision lines."""
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_GatewayOnlyFilter())
+
+
 @pytest.fixture(autouse=True)
 def gateway_logs(caplog):
     """Surface gateway decision logs (caller/version/idempotency key/verdict)."""
@@ -36,7 +49,15 @@ def versions():
 def make_gateway(clock, versions):
     """Factory: build a Gateway with controllable handlers and quota limits."""
 
-    def build(handlers=None, limits=None, window_seconds=60.0, idem_ttl=300.0):
+    def build(
+        handlers=None,
+        limits=None,
+        window_seconds=60.0,
+        idem_ttl=300.0,
+        renderers=None,
+        max_idem_records=None,
+        max_quota_buckets=None,
+    ):
         if handlers is None:
             handlers = {
                 "v2": lambda v, p: {"api_version": v, "echo": p},
@@ -48,8 +69,8 @@ def make_gateway(clock, versions):
                 CallerTier.STANDARD: 50,
                 CallerTier.PRIVILEGED: 500,
             }
-        quota = QuotaLimiter(clock, limits, window_seconds)
-        idem = IdempotencyStore(clock, idem_ttl)
-        return Gateway(versions, quota, idem, handlers, clock)
+        quota = QuotaLimiter(clock, limits, window_seconds, max_buckets=max_quota_buckets)
+        idem = IdempotencyStore(clock, idem_ttl, max_records=max_idem_records)
+        return Gateway(versions, quota, idem, handlers, clock, renderers=renderers)
 
     return build

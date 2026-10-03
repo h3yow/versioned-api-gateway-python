@@ -7,6 +7,8 @@ Headers:
     X-Idempotency-Key: idempotency key for write requests (POST)
 """
 
+import hashlib
+import json
 import logging
 
 import uvicorn
@@ -15,7 +17,7 @@ from fastapi import FastAPI, Request, Response
 from gateway.clock import SystemClock
 from gateway.idempotency import IdempotencyStore
 from gateway.quota import CallerTier, QuotaLimiter
-from gateway.service import Gateway, GatewayRequest
+from gateway.service import Gateway, GatewayRequest, WriteResult
 from gateway.versioning import VersionRegistry, VersionInfo, VersionStatus
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -38,27 +40,48 @@ quota = QuotaLimiter(
         CallerTier.PRIVILEGED: 1000,
     },
     window_seconds=60.0,
+    max_buckets=100_000,
 )
 
-idempotency = IdempotencyStore(clock, ttl_seconds=3600.0)
+# Records older than the TTL (or idle longer than it) are auto-reclaimed;
+# max_records is a hard resident-memory safety valve on top of TTL expiry.
+idempotency = IdempotencyStore(clock, ttl_seconds=3600.0, max_records=1_000_000)
 
 
-def handle_v2(version: str, payload: dict) -> dict:
-    # v2 legacy shape: flat echo.
-    return {"api_version": version, "echo": payload}
+def _create_order(version: str, payload: dict) -> WriteResult:
+    """One version-neutral business write, regardless of client version."""
+    order_id = "ord-" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    canonical = {
+        "order_id": order_id,
+        "item": payload.get("item"),
+        "qty": payload.get("qty", 1),
+    }
+    return WriteResult(business_key=order_id, entity=canonical)
 
 
-def handle_v3(version: str, payload: dict) -> dict:
-    # v3 shape: structured envelope; additive change, v2 untouched.
-    return {"api_version": version, "data": {"attributes": payload}, "meta": {"schema": "v3"}}
+def render_v2(version: str, entity: dict) -> dict:
+    # v2 legacy shape: flat echo of the canonical business entity.
+    return {"api_version": version, "echo": entity}
+
+
+def render_v3(version: str, entity: dict) -> dict:
+    # v3 shape: structured envelope over the same canonical business entity.
+    return {
+        "api_version": version,
+        "data": {"attributes": entity},
+        "meta": {"schema": "v3"},
+    }
 
 
 gateway = Gateway(
     versions,
     quota,
     idempotency,
-    handlers={"v2": handle_v2, "v3": handle_v3},
+    handlers={"v2": _create_order, "v3": _create_order},
     clock=clock,
+    renderers={"v2": render_v2, "v3": render_v3},
 )
 
 app = FastAPI(title="versioned-api-gateway")
