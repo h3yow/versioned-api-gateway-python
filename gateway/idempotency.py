@@ -23,6 +23,7 @@ class IdempotencyRecord:
     state: RecordState
     result: object | None = None
     error: GatewayError | None = None
+    created_at: float = 0.0
     expires_at: float = 0.0
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -42,13 +43,61 @@ class BeginOutcome:
 
 
 class IdempotencyStore:
-    """Thread-safe in-memory idempotency store with TTL."""
+    """Thread-safe in-memory idempotency store with TTL and bounded capacity.
 
-    def __init__(self, clock: Clock, ttl_seconds: float) -> None:
+    Reclamation policy (never changes decisions returned to callers):
+    - terminal records (COMPLETED/FAILED) are dropped once expired (TTL);
+    - IN_FLIGHT records are never evicted while plausibly active; only when
+      `inflight_timeout_seconds` is set and the record is older than that
+      (leader crashed/abandoned) may it be reclaimed;
+    - `max_records` bounds resident memory: on overflow the store sweeps
+      reclaimable records. Records still valid for de-duplication are kept
+      even beyond the cap (the cap then degrades to the live working set).
+    """
+
+    def __init__(
+        self,
+        clock: Clock,
+        ttl_seconds: float,
+        max_records: int | None = None,
+        inflight_timeout_seconds: float | None = None,
+    ) -> None:
         self._clock = clock
         self._ttl = ttl_seconds
+        self._max_records = max_records
+        self._inflight_timeout = inflight_timeout_seconds
         self._lock = threading.Lock()
         self._records: dict[str, IdempotencyRecord] = {}
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def sweep(self) -> int:
+        """Drop reclaimable records; returns how many were removed."""
+        now = self._clock.now()
+        with self._lock:
+            return self._sweep_locked(now)
+
+    def _sweep_locked(self, now: float) -> int:
+        doomed = [
+            key
+            for key, record in self._records.items()
+            if self._reclaimable(record, now)
+        ]
+        for key in doomed:
+            del self._records[key]
+        return len(doomed)
+
+    def _reclaimable(self, record: IdempotencyRecord, now: float) -> bool:
+        if record.state is RecordState.IN_FLIGHT:
+            # Still being processed: only reclaim if abandoned past the
+            # configured in-flight timeout.
+            return (
+                self._inflight_timeout is not None
+                and now - record.created_at >= self._inflight_timeout
+            )
+        return now >= record.expires_at
 
     def begin(self, key: str, payload_fingerprint: str) -> BeginOutcome:
         """Register intent to execute work for `key`.
@@ -59,9 +108,15 @@ class IdempotencyStore:
         """
         now = self._clock.now()
         with self._lock:
+            if self._max_records is not None and len(self._records) >= self._max_records:
+                # Housekeeping under memory pressure: reclaim expired/abandoned
+                # records before deciding. Valid records are never evicted.
+                self._sweep_locked(now)
+
             record = self._records.get(key)
-            if record is not None and record.state is not RecordState.IN_FLIGHT and now >= record.expires_at:
-                # Expired terminal record: drop it so the key can be reused.
+            if record is not None and self._reclaimable(record, now):
+                # Expired terminal record (or abandoned in-flight one): drop it
+                # so the key can be reused.
                 del self._records[key]
                 record = None
 
@@ -70,6 +125,7 @@ class IdempotencyStore:
                     key=key,
                     payload_fingerprint=payload_fingerprint,
                     state=RecordState.IN_FLIGHT,
+                    created_at=now,
                 )
                 self._records[key] = record
                 return BeginOutcome(kind=BeginResult.LEADER, record=record)
@@ -96,6 +152,7 @@ class IdempotencyStore:
                 key=key,
                 payload_fingerprint=payload_fingerprint,
                 state=RecordState.IN_FLIGHT,
+                created_at=now,
             )
             self._records[key] = fresh
             return BeginOutcome(kind=BeginResult.LEADER, record=fresh)

@@ -36,7 +36,7 @@ def versions():
 def make_gateway(clock, versions):
     """Factory: build a Gateway with controllable handlers and quota limits."""
 
-    def build(handlers=None, limits=None, window_seconds=60.0, idem_ttl=300.0):
+    def build(handlers=None, limits=None, window_seconds=60.0, idem_ttl=300.0, renderers=None):
         if handlers is None:
             handlers = {
                 "v2": lambda v, p: {"api_version": v, "echo": p},
@@ -50,6 +50,6 @@ def make_gateway(clock, versions):
             }
         quota = QuotaLimiter(clock, limits, window_seconds)
         idem = IdempotencyStore(clock, idem_ttl)
-        return Gateway(versions, quota, idem, handlers, clock)
+        return Gateway(versions, quota, idem, handlers, clock, renderers=renderers)
 
     return build

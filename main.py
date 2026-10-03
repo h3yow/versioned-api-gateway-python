@@ -7,6 +7,8 @@ Headers:
     X-Idempotency-Key: idempotency key for write requests (POST)
 """
 
+import hashlib
+import json
 import logging
 
 import uvicorn
@@ -38,27 +40,49 @@ quota = QuotaLimiter(
         CallerTier.PRIVILEGED: 1000,
     },
     window_seconds=60.0,
+    # Capacity bound: stale-window buckets are reclaimed under pressure, so
+    # resident memory tracks the callers active in the current window.
+    max_buckets=10_000,
 )
 
-idempotency = IdempotencyStore(clock, ttl_seconds=3600.0)
+idempotency = IdempotencyStore(
+    clock,
+    ttl_seconds=3600.0,
+    # Capacity bound: expired/abandoned records are reclaimed under pressure.
+    max_records=10_000,
+    inflight_timeout_seconds=300.0,
+)
 
 
-def handle_v2(version: str, payload: dict) -> dict:
+def execute_order(version: str, payload: dict) -> dict:
+    """Downstream write, executed exactly once per idempotency key.
+
+    Returns the canonical business result; the per-version response shape is
+    produced by the renderers below, so a replay always matches the shape of
+    the version the replaying caller declared.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    order_id = "ord-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return {"order_id": order_id, "item": payload.get("item"), "qty": payload.get("qty")}
+
+
+def render_v2(canonical: dict) -> dict:
     # v2 legacy shape: flat echo.
-    return {"api_version": version, "echo": payload}
+    return {"api_version": "v2", "echo": canonical}
 
 
-def handle_v3(version: str, payload: dict) -> dict:
+def render_v3(canonical: dict) -> dict:
     # v3 shape: structured envelope; additive change, v2 untouched.
-    return {"api_version": version, "data": {"attributes": payload}, "meta": {"schema": "v3"}}
+    return {"api_version": "v3", "data": {"attributes": canonical}, "meta": {"schema": "v3"}}
 
 
 gateway = Gateway(
     versions,
     quota,
     idempotency,
-    handlers={"v2": handle_v2, "v3": handle_v3},
+    handlers={"v2": execute_order, "v3": execute_order},
     clock=clock,
+    renderers={"v2": render_v2, "v3": render_v3},
 )
 
 app = FastAPI(title="versioned-api-gateway")
